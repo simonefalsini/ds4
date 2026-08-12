@@ -85,6 +85,24 @@ static int agent_log_puts(const char *s) {
     return rc;
 }
 
+static void log_context_memory(ds4_backend backend,
+                               int         ctx_size,
+                               uint32_t    prefill_chunk) {
+    ds4_context_memory m =
+        ds4_context_memory_estimate_with_prefill_mode(backend,
+                                                      ctx_size,
+                                                      prefill_chunk,
+                                                      false);
+    agent_log_fprintf(stderr,
+            "ds4-agent: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
+            (double)m.total_bytes / (1024.0 * 1024.0),
+            ctx_size,
+            ds4_backend_name(backend),
+            m.prefill_cap,
+            m.raw_cap,
+            m.comp_cap);
+}
+
 #define printf(...) agent_log_printf(stdout, __VA_ARGS__)
 #define fprintf(stream, ...) agent_log_fprintf(stream, __VA_ARGS__)
 #define perror(s) agent_log_perror(s)
