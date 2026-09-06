@@ -64259,11 +64259,25 @@ int ds4_chat_append_multimodal_message(
     }
     const bool tool = !strcmp(role, "tool") || !strcmp(role, "function");
     const bool user = !strcmp(role, "user");
-    if ((DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA &&
-         e->vision_kind != DS4_VISION_DEEPSEEK4) || (!tool && !user)) {
+    if (!tool && !user) {
         if (error && error_cap)
             snprintf(error, error_cap,
                      "multimodal messages require a supported user or tool role");
+        return 0;
+    }
+    /* The vision gate belongs to the images, not to the message.  The agent
+     * appends every tool result through here and almost all of them are plain
+     * text: gating those on a vision-capable checkpoint made every one of them
+     * fail on a text-only model.  The caller reads that failure as "the result
+     * does not fit", compacts, fails again, and stops with "context full after
+     * compaction" - a message about a context that was in fact nearly empty.
+     * The agent tool loop was dead on any DeepSeek build without vision. */
+    if (image_count != 0 &&
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA &&
+        e->vision_kind != DS4_VISION_DEEPSEEK4) {
+        if (error && error_cap)
+            snprintf(error, error_cap,
+                     "this model cannot take images in a chat message");
         return 0;
     }
     for (size_t i = 0; i < image_count; i++) {
