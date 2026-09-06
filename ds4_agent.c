@@ -77,6 +77,10 @@ typedef struct {
     const char *gpu_vram_arg;
     const char *gpu_devices_arg;
     const char *chdir_path;
+    /* Non-interactive session thread.  "new" starts one, a sha prefix resumes
+     * that one; absent leaves nothing behind, which is what every existing
+     * caller already relies on. */
+    const char *session;
     bool non_interactive;
     bool edit_upto;
 } agent_config;
@@ -745,6 +749,8 @@ static agent_config parse_options(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--non-interactive")) {
             c.non_interactive = true;
+        } else if (!strcmp(arg, "--session")) {
+            c.session = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--raw") || !strcmp(arg, "--raw-prompt")) {
             c.gen.raw_prompt = true;
         } else if (!strcmp(arg, "--edit-upto")) {
@@ -11385,6 +11391,7 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
 
     const bool one_shot = cfg->gen.prompt != NULL;
     bool one_shot_submitted = false;
+    bool session_ready = false;
     bool stdin_eof = false;
     bool waiting_announced = false;
     bool stdin_nonblock = false;
@@ -11406,6 +11413,24 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     while (true) {
         bool initialized = worker_is_initialized(&worker, NULL);
         bool idle = worker_is_idle(&worker);
+
+        /* The thread is restored before the first prompt is submitted: a turn
+         * answered before the history is back is a turn answered without the
+         * context that made the question make sense. */
+        if (cfg->session && !session_ready && initialized && idle) {
+            if (strcmp(cfg->session, "new") != 0) {
+                char err[160] = {0};
+                if (!agent_worker_switch_session(&worker, cfg->session,
+                                                 AGENT_HISTORY_DEFAULT_TURNS,
+                                                 err, sizeof(err))) {
+                    fprintf(stderr, "ds4-agent: --session %s: %s\n",
+                            cfg->session, err);
+                    rc = 1;
+                    break;
+                }
+            }
+            session_ready = true;
+        }
 
         if (one_shot && !one_shot_submitted && initialized) {
             if (worker_submit(&worker, cfg->gen.prompt))
@@ -11522,6 +11547,17 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
         fflush(stdout);
     }
     free(out);
+
+    /* One non-interactive run is one turn of a longer conversation: whoever
+     * called us gives the next question to the same machine, and a thread that
+     * is not saved starts again from nothing.  Nobody is here to answer the
+     * y/n the interactive path asks, so the save just happens, and the new sha
+     * goes to stdout for the caller to write down. */
+    if (rc == 0 && cfg->session && agent_worker_needs_save(&worker)) {
+        char err[160] = {0};
+        if (!agent_worker_save_session(&worker, err, sizeof(err)))
+            fprintf(stderr, "ds4-agent: session save failed: %s\n", err);
+    }
 
     if (stdin_nonblock) fcntl(STDIN_FILENO, F_SETFL, old_stdin_flags);
     agent_input_buf_free(&input);

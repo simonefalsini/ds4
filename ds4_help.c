@@ -315,6 +315,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--prompt-file FILE", "Read the initial prompt from FILE.");
     opt(fp, c, "--prefix-file FILE", "Preload complete alternating USER:/ASSISTANT: turns before the live task.");
     opt(fp, c, "--non-interactive", "Run without TUI. With an initial prompt: one turn; otherwise: repeated stdin prompts.");
+    opt(fp, c, "--session ID|new", "Non-interactive: resume saved session ID, or start one with new; saved on exit.");
     opt(fp, c, "--raw-prompt", "Non-interactive initial prompt only: omit agent chat/tool text.");
     opt(fp, c, "--edit-upto", "Enable anchored [upto] edits and automatic marker insertion.");
     opt(fp, c, "-sys, --system TEXT", "Extra system prompt. Empty disables extra text.");
