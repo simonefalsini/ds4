@@ -41,6 +41,84 @@
 
 extern char **environ;
 
+static FILE *logscr_fp = NULL;
+
+static void cleanup_log_file(void) {
+    if (logscr_fp) {
+        fclose(logscr_fp);
+        logscr_fp = NULL;
+    }
+}
+
+static void agent_log_printf(FILE *stream, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stream, fmt, ap);
+    va_end(ap);
+
+    if (logscr_fp && (stream == stdout || stream == stderr)) {
+        va_start(ap, fmt);
+        vfprintf(logscr_fp, fmt, ap);
+        fflush(logscr_fp);
+        va_end(ap);
+    }
+}
+
+static void agent_log_fprintf(FILE *stream, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stream, fmt, ap);
+    va_end(ap);
+
+    if (logscr_fp && (stream == stdout || stream == stderr)) {
+        va_start(ap, fmt);
+        vfprintf(logscr_fp, fmt, ap);
+        fflush(logscr_fp);
+        va_end(ap);
+    }
+}
+
+static void agent_log_perror(const char *s) {
+    perror(s);
+    if (logscr_fp) {
+        fprintf(logscr_fp, "%s: %s\n", s, strerror(errno));
+        fflush(logscr_fp);
+    }
+}
+
+static int agent_log_puts(const char *s) {
+    int rc = puts(s);
+    if (logscr_fp) {
+        fputs(s, logscr_fp);
+        fputc('\n', logscr_fp);
+        fflush(logscr_fp);
+    }
+    return rc;
+}
+
+static void log_context_memory(ds4_backend backend,
+                               int         ctx_size,
+                               uint32_t    prefill_chunk) {
+    ds4_context_memory m =
+        ds4_context_memory_estimate_with_prefill_mode(backend,
+                                                      ctx_size,
+                                                      prefill_chunk,
+                                                      false);
+    agent_log_fprintf(stderr,
+            "ds4-agent: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
+            (double)m.total_bytes / (1024.0 * 1024.0),
+            ctx_size,
+            ds4_backend_name(backend),
+            m.prefill_cap,
+            m.raw_cap,
+            m.comp_cap);
+}
+
+#define printf(...) agent_log_printf(stdout, __VA_ARGS__)
+#define fprintf(stream, ...) agent_log_fprintf(stream, __VA_ARGS__)
+#define perror(s) agent_log_perror(s)
+#define puts(s) agent_log_puts(s)
+
 /* This is intentionally not in linenoise.h, but it is part of the existing
  * multiplexed editor implementation.  The agent uses it only to restore text
  * after Enter is pressed while the model is still busy. */
@@ -94,6 +172,10 @@ typedef struct {
      * caller already relies on. */
     const char *session;
     bool non_interactive;
+    bool updind;
+    const char *updind_path;
+    bool dryrun;
+    const char *logscr_path;
     bool edit_upto;
 } agent_config;
 
@@ -198,6 +280,54 @@ typedef struct {
     int next_bash_job_id;
     bool raw_mode_needs_restore;
 } agent_worker;
+
+static char updind_base_dir[PATH_MAX] = {0};
+
+static bool is_path_restricted(const char *path) {
+    if (updind_base_dir[0] == '\0') {
+        return false; /* No restriction */
+    }
+    if (!path) return true; /* Block NULL path if restriction is active */
+
+    char resolved[PATH_MAX];
+    if (realpath(path, resolved)) {
+        size_t len = strlen(updind_base_dir);
+        if (strncmp(resolved, updind_base_dir, len) == 0) {
+            if (resolved[len] == '\0' || resolved[len] == '/') {
+                return false; /* Inside/same, allowed */
+            }
+        }
+        return true; /* Blocked */
+    }
+
+    /* If realpath fails (e.g. file doesn't exist yet), check parent directory */
+    char parent[PATH_MAX];
+    strncpy(parent, path, sizeof(parent) - 1);
+    parent[sizeof(parent) - 1] = '\0';
+
+    char *last_slash = strrchr(parent, '/');
+    if (last_slash) {
+        if (last_slash == parent) {
+            parent[1] = '\0';
+        } else {
+            *last_slash = '\0';
+        }
+    } else {
+        strcpy(parent, ".");
+    }
+
+    if (realpath(parent, resolved)) {
+        size_t len = strlen(updind_base_dir);
+        if (strncmp(resolved, updind_base_dir, len) == 0) {
+            if (resolved[len] == '\0' || resolved[len] == '/') {
+                return false; /* Inside/same, allowed */
+            }
+        }
+        return true; /* Blocked */
+    }
+
+    return true; /* Blocked if parent cannot be resolved */
+}
 
 static unsigned agent_next_prefill_label(void);
 
@@ -538,6 +668,10 @@ static bool agent_worker_images_fit_tokens(const agent_worker *w,
 }
 
 static void write_all(int fd, const char *p, size_t n) {
+    if (logscr_fp && (fd == STDOUT_FILENO || fd == STDERR_FILENO)) {
+        fwrite(p, 1, n, logscr_fp);
+        fflush(logscr_fp);
+    }
     if (fd == STDOUT_FILENO) {
         linenoiseWrite(fd, p, n);
         return;
@@ -714,6 +848,22 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
 }
 
 static agent_config parse_options(int argc, char **argv) {
+    /* Pre-pass to open screen log file if requested */
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--logscr")) {
+            if (i + 1 < argc) {
+                const char *path = argv[i + 1];
+                logscr_fp = fopen(path, "wb");
+                if (!logscr_fp) {
+                    fprintf(stderr, "ds4-agent: failed to open screen log file %s: %s\n",
+                            path, strerror(errno));
+                    exit(2);
+                }
+                atexit(cleanup_log_file);
+            }
+        }
+    }
+
     agent_config c = {
         .engine = {
             .model_path = "ds4flash.gguf",
@@ -818,6 +968,17 @@ static agent_config parse_options(int argc, char **argv) {
             c.non_interactive = true;
         } else if (!strcmp(arg, "--session")) {
             c.session = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dryrun") || !strcmp(arg, "--dry-run")) {
+            c.dryrun = true;
+        } else if (!strcmp(arg, "--logscr")) {
+            c.logscr_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--updind")) {
+            c.updind = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                c.updind_path = argv[++i];
+            } else {
+                c.updind_path = NULL;
+            }
         } else if (!strcmp(arg, "--raw") || !strcmp(arg, "--raw-prompt")) {
             c.gen.raw_prompt = true;
         } else if (!strcmp(arg, "--edit-upto")) {
@@ -5250,6 +5411,9 @@ static void worker_answer_web_approval(agent_worker *w, bool allow,
  * after the tool result is appended, so the next model input can contain both
  * the tool observation and the user's pending correction. */
 static char *worker_request_queued_user_drain(agent_worker *w) {
+    if (w->cfg && w->cfg->updind) {
+        return NULL;
+    }
     pthread_mutex_lock(&w->mu);
     w->queued_user_drain_pending = true;
     w->queued_user_drain_answered = false;
@@ -6977,6 +7141,9 @@ static char *agent_read_range(agent_worker *w, const char *path, int start_line,
 
 static char *agent_tool_read(agent_worker *w, const agent_tool_call *call) {
     const char *path = agent_tool_arg_value(call, "path");
+    if (is_path_restricted(path)) {
+        return xstrdup("Tool error: access denied, path must be inside the directory containing INDEX.md\n");
+    }
     bool whole = agent_parse_bool_default(agent_tool_arg_value(call, "whole"), false);
     int start = agent_parse_int_default(agent_tool_arg_value(call, "start_line"),
                                         1, 1, INT_MAX);
@@ -6990,6 +7157,9 @@ static char *agent_tool_more(agent_worker *w, const agent_tool_call *call) {
     int count = agent_parse_int_default(agent_tool_arg_value(call, "count"),
                                         agent_read_default_lines(w), 1, INT_MAX);
     if (!w->more_valid) return xstrdup("Tool error: no previous output to continue\n");
+    if (is_path_restricted(w->more_path)) {
+        return xstrdup("Tool error: access denied, path must be inside the directory containing INDEX.md\n");
+    }
     return agent_read_range_from(w, w->more_path, w->more_next_line, count, false,
                                  w->more_bare, true, w->more_byte_offset, w->more_mid_line);
 }
@@ -7000,6 +7170,9 @@ static char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
     const char *content = agent_tool_arg_value(call, "content");
     if (!path || !path[0]) return xstrdup("Tool error: write requires path\n");
     if (!content) return xstrdup("Tool error: write requires content\n");
+    if (is_path_restricted(path)) {
+        return xstrdup("Tool error: access denied, path must be inside the directory containing INDEX.md\n");
+    }
     size_t len = strlen(content);
     char err[256];
     if (agent_replace_file(path, content, len, NULL, 0, err, sizeof(err)) != 0) {
@@ -7017,6 +7190,9 @@ static char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
 static char *agent_tool_list(const agent_tool_call *call) {
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) path = ".";
+    if (is_path_restricted(path)) {
+        return xstrdup("Tool error: access denied, path must be inside the directory containing INDEX.md\n");
+    }
     DIR *dir = opendir(path);
     if (!dir) {
         agent_buf b = {0};
@@ -7567,6 +7743,35 @@ static void test_agent_edit_upto_requires_tail_after_newline_strip(void) {
                                                &match, &match_len, &anchored,
                                                err, sizeof(err)));
     AGENT_TEST_ASSERT(strstr(err, "must include a unique tail anchor") != NULL);
+}
+
+static void test_path_restriction(void) {
+    char saved_base[PATH_MAX];
+    strcpy(saved_base, updind_base_dir);
+
+    mkdir("/tmp/ds4_test_limit", 0755);
+    mkdir("/tmp/ds4_test_limit/subdir", 0755);
+
+    char temp_dir[PATH_MAX];
+    if (realpath("/tmp/ds4_test_limit", temp_dir)) {
+        strcpy(updind_base_dir, temp_dir);
+    } else {
+        strcpy(updind_base_dir, "/tmp/ds4_test_limit");
+    }
+
+    AGENT_TEST_ASSERT(!is_path_restricted("/tmp/ds4_test_limit"));
+    AGENT_TEST_ASSERT(!is_path_restricted("/tmp/ds4_test_limit/file.txt"));
+    AGENT_TEST_ASSERT(!is_path_restricted("/tmp/ds4_test_limit/subdir"));
+    AGENT_TEST_ASSERT(!is_path_restricted("/tmp/ds4_test_limit/subdir/another.txt"));
+
+    AGENT_TEST_ASSERT(is_path_restricted("/tmp"));
+    AGENT_TEST_ASSERT(is_path_restricted("/"));
+    AGENT_TEST_ASSERT(is_path_restricted("/etc/passwd"));
+    AGENT_TEST_ASSERT(is_path_restricted("/tmp/ds4_test_limit_extension"));
+
+    AGENT_TEST_ASSERT(is_path_restricted("/tmp/ds4_test_limit/../outside.txt"));
+
+    strcpy(updind_base_dir, saved_base);
 }
 
 static char *agent_test_stream_capture(agent_tool_syntax syntax,
@@ -8165,6 +8370,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_hints_state();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
+    test_path_restriction();
     test_agent_cache_rejects_impossible_lengths();
     test_agent_tp_cache_payload_rebuild_policy();
     test_agent_steering_command();
@@ -8258,6 +8464,9 @@ static char *agent_apply_file_splice(const char *path,
 static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) return xstrdup("Tool error: edit requires path\n");
+    if (is_path_restricted(path)) {
+        return xstrdup("Tool error: access denied, path must be inside the directory containing INDEX.md\n");
+    }
     const char *old = agent_tool_arg_value(call, "old");
     const char *new_text = agent_tool_arg_value(call, "new");
     if (!old || !old[0]) return xstrdup("Tool error: edit requires non-empty old text\n");
@@ -8492,6 +8701,9 @@ static char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
     if (!query || !query[0]) return xstrdup("Tool error: search requires query\n");
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) path = ".";
+    if (is_path_restricted(path)) {
+        return xstrdup("Tool error: access denied, path must be inside the directory containing INDEX.md\n");
+    }
     const char *mode = agent_tool_arg_value(call, "mode");
     if (mode && strcmp(mode, "literal") && strcmp(mode, "regex"))
         return xstrdup("Tool error: search mode must be literal or regex (POSIX extended)\n");
@@ -13288,7 +13500,9 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         editor_cancel_input_with_hint(&editor, prompt, statusline);
                     }
                 } else {
+                    printf("\n");
                     running = false;
+                    exit_save_handled = true;
                 }
             } else {
                 char *cmd = line;
@@ -13547,6 +13761,8 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     return 0;
 }
 
+#include "ds4_updind.c"
+
 #ifndef DS4_AGENT_TEST_NO_MAIN
 int main(int argc, char **argv) {
     agent_config cfg = parse_options(argc, argv);
@@ -13634,6 +13850,10 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+
+    log_context_memory(cfg.engine.backend,
+                       cfg.gen.ctx_size,
+                       cfg.engine.prefill_chunk);
     agent_apply_model_sampling_defaults(engine, &cfg.gen);
 
     /* Model paths and Metal kernel sources are resolved from the launch
@@ -13653,12 +13873,17 @@ int main(int argc, char **argv) {
     memset(&sa, 0, sizeof(sa));
     sigemptyset(&sa.sa_mask);
     sa.sa_handler = agent_sigint_handler;
-    bool sigint_installed = !cfg.non_interactive &&
+    bool sigint_installed = !cfg.non_interactive && !cfg.updind &&
         sigaction(SIGINT, &sa, &old_int) == 0;
 
-    int rc = cfg.non_interactive ?
-        run_agent_non_interactive(engine, &cfg) :
-        run_agent(engine, &cfg);
+    int rc;
+    if (cfg.updind) {
+        rc = run_updind(engine, &cfg);
+    } else {
+        rc = cfg.non_interactive ?
+            run_agent_non_interactive(engine, &cfg) :
+            run_agent(engine, &cfg);
+    }
 
     if (sigint_installed) sigaction(SIGINT, &old_int, NULL);
     if (tp_leader) ds4_tp_send_stop(tp_leader);
