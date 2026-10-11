@@ -35,6 +35,18 @@ static void *exchange(void *arg) {
         if (!ds4_tp_batch_gate_exchange(tp, 0, rows, rows)) return NULL;
         check_pattern(tp->slab + ds4_tp_slab_batch_in_offset(tp, 0), bytes, 1 - p->rank);
     }
+    for (unsigned trial = 0; trial < 3; trial++) {
+        uint32_t gates = trial == 0 ? 2 : trial == 1 ? 1 + p->rank : 1;
+        assert(ds4_tp_batch_block_begin_gates(tp, 3, 40, &gates));
+        assert(gates == (trial == 0 ? 2u : 1u));
+        for (unsigned slot = 0; slot < 40 * gates; slot++) {
+            const size_t bytes = tp->vec_bytes * 3;
+            pattern(tp->slab + ds4_tp_slab_batch_out_offset(tp, slot), bytes, slot * 2 + p->rank);
+            assert(ds4_tp_batch_gate_exchange(tp, slot, 3, slot + 1));
+            check_pattern(tp->slab + ds4_tp_slab_batch_in_offset(tp, slot), bytes, slot * 2 + 1 - p->rank);
+        }
+        assert(ds4_tp_batch_block_end(tp));
+    }
     const size_t capacity = 16 * 1024 * 1024 + 13;
     void *out = malloc(capacity), *in = malloc(capacity);
     assert(out && in);
@@ -53,6 +65,9 @@ static void *exchange(void *arg) {
         }
         check_pattern(in, lengths[i], 1 - p->rank);
     }
+    uint32_t gates = 2;
+    assert(!ds4_tp_batch_block_begin_gates(tp, 1 + p->rank, 40, &gates));
+    assert(ds4_tp_failed(tp));
     free(in); free(out);
     return NULL;
 }
@@ -64,10 +79,21 @@ static void pair(int fd[2], bool tcp) {
             .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
         socklen_t len = sizeof(addr);
         assert(listener >= 0 && bind(listener, (struct sockaddr *)&addr, len) == 0);
+#ifdef __linux__
+        /* Loopback's 32 KiB segments exceed the tiny receive window below.
+         * Use small segments to test backpressure without zero-window probes
+         * throttling a 16 MiB transfer for minutes. Set this before SYN. */
+        const int mss = 512;
+        assert(setsockopt(listener, IPPROTO_TCP, TCP_MAXSEG, &mss, sizeof(mss)) == 0);
+#endif
         assert(getsockname(listener, (struct sockaddr *)&addr, &len) == 0);
         assert(listen(listener, 1) == 0);
         fd[0] = socket(AF_INET, SOCK_STREAM, 0);
-        assert(fd[0] >= 0 && connect(fd[0], (struct sockaddr *)&addr, len) == 0);
+        assert(fd[0] >= 0);
+#ifdef __linux__
+        assert(setsockopt(fd[0], IPPROTO_TCP, TCP_MAXSEG, &mss, sizeof(mss)) == 0);
+#endif
+        assert(connect(fd[0], (struct sockaddr *)&addr, len) == 0);
         fd[1] = accept(listener, NULL, NULL);
         assert(fd[1] >= 0);
         close(listener);
