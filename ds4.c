@@ -42625,8 +42625,11 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             if (ok) ok = metal_graph_stream_map_layer(m, w, il);
 #endif
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-            /* Below 2K, unused expert reads outweigh the overlap. */
-            if (ok && total_count >= 2048u) {
+            /* File-ordered selected reads are the default. Whole-layer
+             * prefetch trades unused weight reads for overlap; retain it as
+             * an explicit option for other storage/workload combinations. */
+            if (ok && total_count >= 2048u &&
+                getenv("DS4_CUDA_ENABLE_SSD_PREFETCH") != NULL) {
                 const ds4_gpu_stream_expert_table current = graph_stream_expert_table_make(m,
                     &w->layer[il], il,
                     routed_expert_row_bytes(w->layer[il].ffn_gate_exps) * DS4_N_FF_EXP,
